@@ -2,3 +2,5 @@
 https://github.com/gitalexhubuser/whisper-ptt
 
 в shell:startup start.vbs — ярлык
+
+запуск на ф9
