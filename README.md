@@ -1,0 +1,1 @@
+Аналог сервиса blabby.ai на базе whisper (offline)
