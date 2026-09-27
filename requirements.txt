@@ -1,0 +1,14 @@
+faster-whisper
+sounddevice
+numpy
+pyperclip
+pynput
+pystray
+Pillow
+pygame
+# pip install -r requirements.txt
+
+# pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+
+# pip install faster-whisper sounddevice numpy pyperclip pynput pystray Pillow
+# pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
