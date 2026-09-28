@@ -17,6 +17,19 @@ if sys.platform == "win32":
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
+# ============ CTranslate2 / setuptools >= 72 compatibility patch ============
+try:
+    import pkg_resources
+except ImportError:
+    class _PRShim:
+        @staticmethod
+        def resource_filename(mod, rel):
+            import importlib.util
+            spec = importlib.util.find_spec(mod)
+            p = os.path.dirname(spec.origin) if (spec and spec.origin) else ""
+            return os.path.join(p, rel)
+    sys.modules["pkg_resources"] = _PRShim()
+
 # ============ WinAPI SendInput (Unicode-печать без буфера) ============
 import ctypes
 import time as _time
@@ -500,25 +513,125 @@ def set_color(color):
             pass
 
 
+def set_tray_status(status_text=None):
+    if icon is not None:
+        try:
+            if status_text:
+                icon.title = f"Whisper PTT — {status_text} ({HOTKEY_STR})"
+            else:
+                icon.title = f"Whisper PTT — ready ({HOTKEY_STR})"
+        except Exception:
+            pass
+
+
 # ---------- Model ----------
 def load_model():
     global model
     try:
-        if BACKEND == "faster":
-            from faster_whisper import WhisperModel
-            print(f"[whisper] loading {MODEL_NAME} on {DEVICE} ({COMPUTE_TYPE})…")
-            model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
-        elif BACKEND == "openai":
-            import whisper
-            model = whisper.load_model(MODEL_NAME, device=DEVICE)
-        else:
-            raise ValueError(f"Unknown backend: {BACKEND}")
+        set_tray_status("загрузка 0%")
+
+        # Перехват прогресса скачивания весов (при первом запуске/скачивании)
+        try:
+            from tqdm.auto import tqdm
+
+            class _TrayDownloadProgress(tqdm):
+                _last_pct = -1
+                _last_t = 0.0
+
+                def __init__(self, *args, **kwargs):
+                    kwargs["disable"] = False
+                    super().__init__(*args, **kwargs)
+                    self._report()
+
+                def update(self, n=1):
+                    super().update(n)
+                    self._report()
+
+                def _report(self):
+                    if self.total and self.total > 0:
+                        pct = max(0, min(100, int((self.n / self.total) * 100)))
+                        now = _time.time()
+                        if pct != _TrayDownloadProgress._last_pct and (now - _TrayDownloadProgress._last_t >= 0.15 or pct in (0, 100)):
+                            _TrayDownloadProgress._last_pct = pct
+                            _TrayDownloadProgress._last_t = now
+                            set_tray_status(f"скачивание {pct}%")
+
+            import faster_whisper.utils
+            faster_whisper.utils.disabled_tqdm = _TrayDownloadProgress
+        except Exception as e:
+            print(f"[whisper] tqdm patch error: {e}")
+
+        # Монитор чтения весов из файла в RAM / VRAM (для отображения % при каждом старте)
+        stop_monitor = threading.Event()
+
+        def _monitor_loading():
+            try:
+                import psutil
+                proc = psutil.Process()
+                b_start = proc.io_counters().read_bytes
+                size_map = {
+                    "tiny": 75 * 1024 * 1024,
+                    "base": 145 * 1024 * 1024,
+                    "small": 485 * 1024 * 1024,
+                    "medium": 1500 * 1024 * 1024,
+                    "large-v3-turbo": 1600 * 1024 * 1024,
+                    "turbo": 1600 * 1024 * 1024,
+                    "large-v3": 3100 * 1024 * 1024,
+                    "large": 3100 * 1024 * 1024,
+                }
+                expected = size_map.get(MODEL_NAME.lower(), 1600 * 1024 * 1024)
+                last_pct = 0
+                t0 = _time.time()
+                while not stop_monitor.wait(0.2):
+                    read_b = proc.io_counters().read_bytes - b_start
+                    if read_b > 0:
+                        pct = min(98, int((read_b / expected) * 100))
+                    else:
+                        pct = min(90, int((_time.time() - t0) * 8))
+                    if pct > last_pct:
+                        last_pct = pct
+                        set_tray_status(f"загрузка {pct}%")
+            except Exception:
+                pass
+
+        monitor_th = threading.Thread(target=_monitor_loading, daemon=True)
+        monitor_th.start()
+
+        # Автопоиск локальной папки с моделью (без обращения к интернету)
+        local_dir = None
+        for cand in [
+            Path(MODEL_NAME),
+            APP_DIR / MODEL_NAME,
+            APP_DIR / "models" / MODEL_NAME,
+            Path("C:/models") / MODEL_NAME,
+        ]:
+            if cand.is_dir() and (cand / "model.bin").exists():
+                local_dir = str(cand.resolve())
+                break
+
+        target_model = local_dir if local_dir else MODEL_NAME
+
+        try:
+            if BACKEND == "faster":
+                from faster_whisper import WhisperModel
+                if local_dir:
+                    print(f"[whisper] offline load from: {local_dir}")
+                else:
+                    print(f"[whisper] loading {MODEL_NAME} on {DEVICE} ({COMPUTE_TYPE})…")
+                model = WhisperModel(target_model, device=DEVICE, compute_type=COMPUTE_TYPE)
+            elif BACKEND == "openai":
+                import whisper
+                model = whisper.load_model(MODEL_NAME, device=DEVICE)
+            else:
+                raise ValueError(f"Unknown backend: {BACKEND}")
+        finally:
+            stop_monitor.set()
+            monitor_th.join(timeout=1.0)
 
         model_ready.set()
         set_color(COLOR_IDLE)
+        set_tray_status(None)
         print(f"[whisper] READY ({BACKEND}, {DEVICE}, {COMPUTE_TYPE})")
-        if icon:
-            icon.title = f"Whisper PTT — ready ({HOTKEY_STR})"
 
     except Exception as e:
         print(f"[whisper] FAILED: {e}")
@@ -756,7 +869,7 @@ def main():
     icon = Icon(
         "whisper-ptt",
         make_image(COLOR_LOAD),
-        title=f"Whisper PTT — loading… ({HOTKEY_STR})",
+        title=f"Whisper PTT — загрузка 0% ({HOTKEY_STR})",
         menu=Menu(
             MenuItem(f"Хоткей: {HOTKEY_STR}", None, enabled=False),
             MenuItem(f"Модель: {MODEL_NAME}", None, enabled=False),
