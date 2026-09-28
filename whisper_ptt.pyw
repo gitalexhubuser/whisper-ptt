@@ -128,6 +128,63 @@ def _send_unicode_char(ch):
         _send_unicode_scan(code, True)
 
 
+def _send_unicode_batch(text):
+    """Отправляет весь текст целиком за один системный вызов WinAPI SendInput."""
+    inputs = []
+    for ch in text:
+        code = ord(ch)
+        if code > 0xFFFF:
+            code -= 0x10000
+            high = 0xD800 + (code >> 10)
+            low  = 0xDC00 + (code & 0x3FF)
+            for scan in (high, low):
+                inp_down = _INPUT()
+                inp_down.type = INPUT_KEYBOARD
+                inp_down.u.ki.wVk = 0
+                inp_down.u.ki.wScan = scan
+                inp_down.u.ki.dwFlags = KEYEVENTF_UNICODE
+                inp_down.u.ki.time = 0
+                inp_down.u.ki.dwExtraInfo = None
+                inputs.append(inp_down)
+
+                inp_up = _INPUT()
+                inp_up.type = INPUT_KEYBOARD
+                inp_up.u.ki.wVk = 0
+                inp_up.u.ki.wScan = scan
+                inp_up.u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                inp_up.u.ki.time = 0
+                inp_up.u.ki.dwExtraInfo = None
+                inputs.append(inp_up)
+        else:
+            inp_down = _INPUT()
+            inp_down.type = INPUT_KEYBOARD
+            inp_down.u.ki.wVk = 0
+            inp_down.u.ki.wScan = code
+            inp_down.u.ki.dwFlags = KEYEVENTF_UNICODE
+            inp_down.u.ki.time = 0
+            inp_down.u.ki.dwExtraInfo = None
+            inputs.append(inp_down)
+
+            inp_up = _INPUT()
+            inp_up.type = INPUT_KEYBOARD
+            inp_up.u.ki.wVk = 0
+            inp_up.u.ki.wScan = code
+            inp_up.u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+            inp_up.u.ki.time = 0
+            inp_up.u.ki.dwExtraInfo = None
+            inputs.append(inp_up)
+
+    if not inputs:
+        return 0
+
+    c_inputs = (_INPUT * len(inputs))(*inputs)
+    ret = ctypes.windll.user32.SendInput(len(inputs), c_inputs, ctypes.sizeof(_INPUT))
+    if ret != len(inputs):
+        err = ctypes.windll.kernel32.GetLastError()
+        print(f"[sendinput] BATCH FAILED sent {ret}/{len(inputs)} err={err}")
+    return ret
+
+
 def _type_text(text, char_delay=0.001):
     for ch in text:
         _send_unicode_char(ch)
@@ -142,6 +199,7 @@ def _release_all_modifiers():
 
 
 import configparser
+import queue
 import threading
 from collections import deque
 from pathlib import Path
@@ -174,8 +232,10 @@ sample_rate = 16000
 add_trailing_space = true
 
 [paste]
+# method: unicode (рекомендуется) или clipboard
 method = unicode
-char_delay = 0.001
+# char_delay = 0.0 для мгновенной пакетной вставки через SendInput
+char_delay = 0.0
 
 [log]
 enabled = true
@@ -210,7 +270,7 @@ SAMPLE_RATE  = cfg.getint("audio",  "sample_rate", fallback=16000)
 ADD_SPACE    = cfg.getboolean("text", "add_trailing_space", fallback=True)
 
 PASTE_METHOD = cfg.get("paste", "method", fallback="unicode").strip().lower()
-CHAR_DELAY   = cfg.getfloat("paste", "char_delay", fallback=0.001)
+CHAR_DELAY   = cfg.getfloat("paste", "char_delay", fallback=0.0)
 
 LOG_ENABLED  = cfg.getboolean("log", "enabled", fallback=True)
 LOG_FILE     = APP_DIR / cfg.get("log", "file", fallback="transcriptions.log").strip()
@@ -400,15 +460,19 @@ def open_history_window(icon_, item):
     root.mainloop()
 
 
-# ---------- State ----------
+# ---------- State & Queues ----------
 model = None
 model_lock = threading.Lock()
 model_ready = threading.Event()
 
 recording = False
 audio_chunks = []
+# Pre-roll ring buffer (~250ms audio to never miss the first syllable)
+_preroll_buffer = deque(maxlen=2)
 stream = None
 stream_lock = threading.Lock()
+
+_audio_queue = queue.Queue()
 
 icon = None
 
@@ -466,27 +530,43 @@ def load_model():
                 pass
 
 
-# ---------- Recording ----------
+# ---------- Persistent Audio Stream ----------
 def _audio_cb(indata, frames, time_info, status):
     if recording:
         audio_chunks.append(indata.copy())
+    else:
+        _preroll_buffer.append(indata.copy())
+
+
+def init_audio_stream():
+    global stream
+    try:
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=2048,
+            callback=_audio_cb,
+        )
+        stream.start()
+        print("[audio] persistent stream active (zero-latency start enabled)")
+    except Exception as e:
+        print(f"[audio] failed to start audio stream: {e}")
 
 
 def start_recording():
-    global recording, stream, audio_chunks
+    global recording, audio_chunks
     if not model_ready.is_set():
         print("[rec] model not ready")
         return
     with stream_lock:
         if recording:
             return
-        audio_chunks = []
+        # Захватываем pre-roll буфер, чтобы не потерять начало фразы
+        audio_chunks = list(_preroll_buffer)
+        _preroll_buffer.clear()
         recording = True
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            callback=_audio_cb,
-        )
-        stream.start()
+
     set_color(COLOR_REC)
     if icon:
         icon.title = f"Whisper PTT — REC ({HOTKEY_STR})"
@@ -494,24 +574,30 @@ def start_recording():
 
 
 def stop_recording():
-    global recording, stream
+    global recording
     with stream_lock:
         if not recording:
             return
         recording = False
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
-            stream = None
         chunks = list(audio_chunks)
+
     set_color(COLOR_IDLE)
     if icon:
         icon.title = f"Whisper PTT — transcribing… ({HOTKEY_STR})"
-    print("[rec] stopped")
-    threading.Thread(target=process_audio, args=(chunks,), daemon=True).start()
+    print("[rec] stopped, queued for transcription")
+    _audio_queue.put(chunks)
+
+
+def _worker_loop():
+    """Фоновый поток для последовательной и быстрой обработки аудио."""
+    while True:
+        chunks = _audio_queue.get()
+        try:
+            process_audio(chunks)
+        except Exception as e:
+            print(f"[worker] process error: {e}")
+        finally:
+            _audio_queue.task_done()
 
 
 def process_audio(chunks):
@@ -523,7 +609,8 @@ def process_audio(chunks):
         print(f"[rec] concat error: {e}")
         return
 
-    if len(audio) < SAMPLE_RATE * 0.4:
+    # Отсекаем слишком короткие клики (< 0.35 сек)
+    if len(audio) < SAMPLE_RATE * 0.35:
         print("[rec] too short, skip")
         if icon:
             icon.title = f"Whisper PTT — ready ({HOTKEY_STR})"
@@ -537,10 +624,12 @@ def process_audio(chunks):
                     audio,
                     language=LANGUAGE,
                     beam_size=BEAM_SIZE,
+                    temperature=0.0,
+                    without_timestamps=True,
                     vad_filter=True,
                     vad_parameters={
-                        "min_silence_duration_ms": 700,
-                        "speech_pad_ms": 400,
+                        "min_silence_duration_ms": 300,
+                        "speech_pad_ms": 200,
                     },
                     condition_on_previous_text=False,
                 )
@@ -561,7 +650,8 @@ def process_audio(chunks):
 
     text = text.strip()
     dur = len(audio) / SAMPLE_RATE
-    print(f"[rec] {dur:.1f}s audio -> {_time.time()-t0:.2f}s -> {text!r}")
+    dt = _time.time() - t0
+    print(f"[rec] {dur:.1f}s audio -> {dt:.2f}s (rtf={dt/max(dur, 0.01):.2f}) -> {text!r}")
 
     if text:
         log_transcription(text)
@@ -582,12 +672,15 @@ def process_audio(chunks):
 
 def type_text_to_active_window(text):
     _release_all_modifiers()
-    _time.sleep(0.05)
+    _time.sleep(0.01)
     t0 = _time.time()
     try:
-        _type_text(text, char_delay=CHAR_DELAY)
+        if CHAR_DELAY > 0:
+            _type_text(text, char_delay=CHAR_DELAY)
+        else:
+            _send_unicode_batch(text)
         dt = _time.time() - t0
-        print(f"[type] sent {len(text)} chars in {dt:.2f}s")
+        print(f"[type] sent {len(text)} chars in {dt*1000:.1f}ms")
     except Exception as e:
         print(f"[type] failed: {e}")
 
@@ -600,15 +693,15 @@ def paste_via_clipboard(text):
         print(f"[paste] clipboard error: {e}")
         return
 
-    _time.sleep(0.1)
     _release_all_modifiers()
-    _time.sleep(0.25)
+    _time.sleep(0.02)
 
-    n1 = _send_key(VK_LCONTROL, up=False); _time.sleep(0.03)
-    n2 = _send_key(VK_V,        up=False); _time.sleep(0.03)
-    n3 = _send_key(VK_V,        up=True);  _time.sleep(0.03)
-    n4 = _send_key(VK_LCONTROL, up=True)
-    print(f"[paste] SendInput total events: {n1+n2+n3+n4}/4")
+    _send_key(VK_LCONTROL, up=False)
+    _send_key(VK_V,        up=False)
+    _time.sleep(0.01)
+    _send_key(VK_V,        up=True)
+    _send_key(VK_LCONTROL, up=True)
+    print(f"[paste] pasted {len(text)} chars via clipboard")
 
 
 # ---------- Listener ----------
@@ -644,8 +737,16 @@ def run_listener():
 
 # ---------- Tray ----------
 def on_quit(icon_, item):
+    global stream
+    if stream is not None:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
     try:
-        icon_.stop()
+        if icon_:
+            icon_.stop()
     finally:
         os._exit(0)
 
@@ -670,6 +771,8 @@ def main():
         ),
     )
 
+    init_audio_stream()
+    threading.Thread(target=_worker_loop, daemon=True).start()
     threading.Thread(target=load_sound, daemon=True).start()
     threading.Thread(target=load_model, daemon=True).start()
     threading.Thread(target=run_listener, daemon=True).start()
