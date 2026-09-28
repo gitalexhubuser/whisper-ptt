@@ -6,7 +6,7 @@ if sys.platform == "win32":
     try:
         import site
         for sp in site.getsitepackages():
-            for sub in ("nvidia/cublas/bin", "nvidia/cudnn/bin"):
+            for sub in ("nvidia/cublas/bin", "nvidia/cudnn/bin", "nvidia/cuda_runtime/bin", "nvidia/cuda_nvrtc/bin"):
                 p = os.path.join(sp, sub.replace("/", os.sep))
                 if os.path.isdir(p):
                     os.add_dll_directory(p)
@@ -17,13 +17,11 @@ if sys.platform == "win32":
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-# ============ CTranslate2 / setuptools >= 72 compatibility patch ============
-try:
-    import pkg_resources
-except ImportError:
+# ============ CTranslate2 shim (ctranslate2 ожидает pkg_resources) ============
+if "pkg_resources" not in sys.modules:
     class _PRShim:
         @staticmethod
-        def resource_filename(mod, rel):
+        def resource_filename(mod, rel=""):
             import importlib.util
             spec = importlib.util.find_spec(mod)
             p = os.path.dirname(spec.origin) if (spec and spec.origin) else ""
