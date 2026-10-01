@@ -1031,6 +1031,38 @@ def process_audio(chunks):
 
     text = text.strip()
 
+    # Фильтр галлюцинаций Whisper — фразы которые модель придумывает
+    # из тишины или шума, особенно на русском языке.
+    _HALLUCINATIONS = [
+        "субтитры сделал dimatorzok",
+        "субтитры сделал",
+        "субтитры сделал dimatorzok.",
+        "спасибо за просмотр",
+        "подписывайтесь на канал",
+        "приятного просмотра",
+        "вы можете помочь развитию канала",
+        "я в вк",
+        "музыка",
+    ]
+    _text_lower = text.lower()
+    for _hall in _HALLUCINATIONS:
+        if _hall in _text_lower:
+            print(f"[rec] hallucination filtered: {_hall!r}")
+            text = text.replace(_hall, "")
+            # Также убираем с большой буквы
+            text = text.replace(_hall.capitalize(), "")
+    text = text.strip()
+
+    # Если после фильтрации ничего не осталось — пропускаем
+    if not text:
+        print("[rec] empty after hallucination filter")
+        if icon:
+            icon.title = (
+                f"Whisper PTT — ready "
+                f"({HOTKEY_STR}, {HOTKEY_MODE})"
+            )
+        return
+
     dur = len(audio) / SAMPLE_RATE
     dt = _time.time() - t0
 
