@@ -15,7 +15,10 @@ if sys.platform == "win32":
     except Exception as e:
         print(f"[cuda] patch failed: {e}")
 
+# ============ NO INTERNET ============
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 # ============ CTranslate2 shim (ctranslate2 ожидает pkg_resources) ============
 if "pkg_resources" not in sys.modules:
@@ -169,7 +172,6 @@ def _send_unicode_batch(text):
                 inp_up.u.ki.time = 0
                 inp_up.u.ki.dwExtraInfo = None
                 inputs.append(inp_up)
-
         else:
             inp_down = _INPUT()
             inp_down.type = INPUT_KEYBOARD
@@ -271,7 +273,10 @@ file = transcriptions.log
 
 [sound]
 enabled = true
-file = ready.mp3
+# Файлы звуков (MP3/WAV). Если файл не найден — используется системный beep
+start_file = start.mp3
+end_file = end.mp3
+ready_file = ready.mp3
 volume = 0.7
 """
 
@@ -292,93 +297,40 @@ def ensure_config():
 cfg = ensure_config()
 
 
-BACKEND      = cfg.get("whisper", "backend",      fallback="faster").strip().lower()
-MODEL_NAME   = cfg.get("whisper", "model",        fallback="large-v3-turbo").strip()
-DEVICE       = cfg.get("whisper", "device",       fallback="cuda").strip()
+BACKEND      = cfg.get("whisper", "backend", fallback="faster").strip().lower()
+MODEL_NAME   = cfg.get("whisper", "model", fallback="large-v3-turbo").strip()
+DEVICE       = cfg.get("whisper", "device", fallback="cuda").strip()
 COMPUTE_TYPE = cfg.get("whisper", "compute_type", fallback="int8_float32").strip()
-LANGUAGE     = cfg.get("whisper", "language",     fallback="ru").strip() or None
+LANGUAGE     = cfg.get("whisper", "language", fallback="ru").strip() or None
 BEAM_SIZE    = cfg.getint("whisper", "beam_size", fallback=1)
 
-
-HOTKEY_STR = cfg.get(
-    "hotkey",
-    "key",
-    fallback="f9"
-).strip().lower()
-
-HOTKEY_MODE = cfg.get(
-    "hotkey",
-    "mode",
-    fallback="hold"
-).strip().lower()
+HOTKEY_STR = cfg.get("hotkey", "key", fallback="f9").strip().lower()
+HOTKEY_MODE = cfg.get("hotkey", "mode", fallback="hold").strip().lower()
 
 if HOTKEY_MODE not in ("hold", "toggle"):
-    print(
-        f"[hotkey] неизвестный mode={HOTKEY_MODE!r}, "
-        f"используется hold"
-    )
+    print(f"[hotkey] неизвестный mode={HOTKEY_MODE!r}, используется hold")
     HOTKEY_MODE = "hold"
 
+SAMPLE_RATE = cfg.getint("audio", "sample_rate", fallback=16000)
+ADD_SPACE = cfg.getboolean("text", "add_trailing_space", fallback=True)
 
-SAMPLE_RATE = cfg.getint(
-    "audio",
-    "sample_rate",
-    fallback=16000
-)
+PASTE_METHOD = cfg.get("paste", "method", fallback="unicode").strip().lower()
+CHAR_DELAY = cfg.getfloat("paste", "char_delay", fallback=0.0)
 
-ADD_SPACE = cfg.getboolean(
-    "text",
-    "add_trailing_space",
-    fallback=True
-)
+LOG_ENABLED = cfg.getboolean("log", "enabled", fallback=True)
+LOG_FILE = APP_DIR / cfg.get("log", "file", fallback="transcriptions.log").strip()
 
+SOUND_ENABLED = cfg.getboolean("sound", "enabled", fallback=True)
+SOUND_VOLUME = cfg.getfloat("sound", "volume", fallback=0.7)
 
-PASTE_METHOD = cfg.get(
-    "paste",
-    "method",
-    fallback="unicode"
-).strip().lower()
-
-CHAR_DELAY = cfg.getfloat(
-    "paste",
-    "char_delay",
-    fallback=0.0
-)
+# Backward compat: если ready_file нет в конфиге — берём старый file
+_ready_fallback = cfg.get("sound", "file", fallback="ready.mp3").strip()
+SOUND_START_FILE = cfg.get("sound", "start_file", fallback="start.mp3").strip()
+SOUND_END_FILE = cfg.get("sound", "end_file", fallback="end.mp3").strip()
+SOUND_READY_FILE = cfg.get("sound", "ready_file", fallback=_ready_fallback).strip()
 
 
-LOG_ENABLED = cfg.getboolean(
-    "log",
-    "enabled",
-    fallback=True
-)
-
-LOG_FILE = APP_DIR / cfg.get(
-    "log",
-    "file",
-    fallback="transcriptions.log"
-).strip()
-
-
-SOUND_ENABLED = cfg.getboolean(
-    "sound",
-    "enabled",
-    fallback=True
-)
-
-SOUND_FILE = APP_DIR / cfg.get(
-    "sound",
-    "file",
-    fallback="ready.mp3"
-).strip()
-
-SOUND_VOLUME = cfg.getfloat(
-    "sound",
-    "volume",
-    fallback=0.7
-)
-
-
-# ---------- Hotkey resolve (одна конкретная клавиша) ----------
+# ---------- Hotkey resolve ----------
 def resolve_hotkey(name):
     """'f9' → keyboard.Key.f9, 'scroll_lock' → keyboard.Key.scroll_lock, 'a' → KeyCode."""
     name = name.strip().lower()
@@ -386,10 +338,7 @@ def resolve_hotkey(name):
     if name.startswith("f") and name[1:].isdigit():
         if hasattr(keyboard.Key, name):
             return getattr(keyboard.Key, name)
-
-        raise ValueError(
-            f"Неизвестная F-клавиша: {name}"
-        )
+        raise ValueError(f"Неизвестная F-клавиша: {name}")
 
     if len(name) == 1:
         return keyboard.KeyCode.from_char(name)
@@ -397,73 +346,152 @@ def resolve_hotkey(name):
     if hasattr(keyboard.Key, name):
         return getattr(keyboard.Key, name)
 
-    raise ValueError(
-        f"Неизвестная клавиша: {name}"
-    )
+    raise ValueError(f"Неизвестная клавиша: {name}")
 
 
 HOTKEY = resolve_hotkey(HOTKEY_STR)
 
-print(
-    f"[hotkey] using: {HOTKEY_STR} "
-    f"mode={HOTKEY_MODE} ({HOTKEY})"
-)
+print(f"[hotkey] using: {HOTKEY_STR} mode={HOTKEY_MODE} ({HOTKEY})")
 
 
-# ---------- Sound ----------
-_sound_obj = None
-_sound_ready = False
+# ---------- Sound (winmm.dll — без pygame) ----------
+_winmm = ctypes.windll.winmm
+_winmm.mciSendStringW.argtypes = [
+    ctypes.c_wchar_p,
+    ctypes.c_wchar_p,
+    ctypes.c_uint,
+    ctypes.c_void_p,
+]
+_winmm.mciSendStringW.restype = ctypes.c_uint
+
+_mci_lock = threading.Lock()
+_mci_counter = 0
+
+_sound_start_file = None
+_sound_end_file = None
+_sound_ready_file = None
+
+
+def _play_audio_file(filepath):
+    """Воспроизводит аудиофайл (MP3/WAV) через Windows winmm (mciSendString).
+
+    Использует уникальный alias для каждого вызова, чтобы звуки не
+    прерывали друг друга. Устройство закрывается через 5 секунд в
+    фоновом потоке.
+    """
+    global _mci_counter
+
+    filepath = os.path.abspath(str(filepath))
+
+    with _mci_lock:
+        _mci_counter += 1
+        alias = f"wpsnd_{_mci_counter}"
+
+        try:
+            cmd = f'open "{filepath}" alias {alias}'
+            ret = _winmm.mciSendStringW(cmd, None, 0, None)
+
+            if ret != 0:
+                # Пробуем с явным указанием типа mpegvideo (для MP3)
+                cmd = f'open "{filepath}" type mpegvideo alias {alias}'
+                ret = _winmm.mciSendStringW(cmd, None, 0, None)
+
+                if ret != 0:
+                    return False
+
+            # Громкость (0..1000)
+            try:
+                vol = max(0, min(1000, int(SOUND_VOLUME * 1000)))
+                _winmm.mciSendStringW(
+                    f'setaudio {alias} volume to {vol}',
+                    None, 0, None
+                )
+            except Exception:
+                pass
+
+            _winmm.mciSendStringW(f'play {alias}', None, 0, None)
+
+        except Exception as e:
+            print(f"[sound] play error: {e}")
+            return False
+
+    # Закрытие устройства через 5 секунд
+    def _cleanup():
+        _time.sleep(5)
+        with _mci_lock:
+            try:
+                _winmm.mciSendStringW(f'close {alias}', None, 0, None)
+            except Exception:
+                pass
+
+    threading.Thread(target=_cleanup, daemon=True).start()
+
+    return True
+
+
+def _beep_async(freq, duration):
+    """Системный beep в фоновом потоке (не блокирует listener)."""
+    threading.Thread(
+        target=_try_beep,
+        args=(freq, duration),
+        daemon=True
+    ).start()
+
+
+def _try_beep(freq, duration):
+    try:
+        import winsound
+        winsound.Beep(freq, duration)
+    except Exception:
+        pass
 
 
 def load_sound():
-    global _sound_obj, _sound_ready
+    """Проверяет наличие звуковых файлов. Не требует pygame."""
+    global _sound_start_file, _sound_end_file, _sound_ready_file
 
     if not SOUND_ENABLED:
         print("[sound] disabled")
         return
 
-    if not SOUND_FILE.exists():
-        print(
-            f"[sound] file not found: {SOUND_FILE} — звук отключён"
-        )
+    for name, attr, filename in [
+        ("start", "_sound_start_file", SOUND_START_FILE),
+        ("end",   "_sound_end_file",   SOUND_END_FILE),
+        ("ready", "_sound_ready_file",  SOUND_READY_FILE),
+    ]:
+        path = APP_DIR / filename
+        if path.exists():
+            globals()[attr] = path
+            print(f"[sound] {name}: {filename}")
+        else:
+            print(f"[sound] {name}: {filename} не найден — beep")
+
+
+def play_start_sound():
+    """Звук начала записи."""
+    if not SOUND_ENABLED:
         return
+    if _sound_start_file and _play_audio_file(str(_sound_start_file)):
+        return
+    _beep_async(1000, 80)
 
-    try:
-        import pygame
 
-        pygame.mixer.pre_init(
-            frequency=44100,
-            size=-16,
-            channels=2,
-            buffer=512
-        )
-
-        pygame.mixer.init()
-
-        _sound_obj = pygame.mixer.Sound(
-            str(SOUND_FILE)
-        )
-
-        _sound_obj.set_volume(SOUND_VOLUME)
-
-        _sound_ready = True
-
-        print(
-            f"[sound] loaded: {SOUND_FILE.name}"
-        )
-
-    except Exception as e:
-        print(f"[sound] load failed: {e}")
+def play_end_sound():
+    """Звук окончания записи."""
+    if not SOUND_ENABLED:
+        return
+    if _sound_end_file and _play_audio_file(str(_sound_end_file)):
+        return
+    _beep_async(500, 80)
 
 
 def play_ready_sound():
-    if not _sound_ready or _sound_obj is None:
+    """Звук готовности (после распознавания или загрузки модели)."""
+    if not SOUND_ENABLED:
         return
-
-    try:
-        _sound_obj.play()
-    except Exception as e:
-        print(f"[sound] play failed: {e}")
+    if _sound_ready_file and _play_audio_file(str(_sound_ready_file)):
+        return
+    _beep_async(750, 100)
 
 
 # ---------- Log & internal buffer ----------
@@ -477,23 +505,13 @@ def log_transcription(text):
         return
 
     try:
-        ts = _time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        ts = _time.strftime("%Y-%m-%d %H:%M:%S")
 
-        with open(
-            LOG_FILE,
-            "a",
-            encoding="utf-8"
-        ) as f:
-            f.write(
-                f"[{ts}] {text}\n"
-            )
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {text}\n")
 
     except Exception as e:
-        print(
-            f"[log] write failed: {e}"
-        )
+        print(f"[log] write failed: {e}")
 
 
 def open_log_file(icon_, item):
@@ -510,15 +528,9 @@ def open_log_file(icon_, item):
 
     try:
         os.startfile(str(LOG_FILE))
-
-        print(
-            f"[tray] opened log: {LOG_FILE}"
-        )
-
+        print(f"[tray] opened log: {LOG_FILE}")
     except Exception as e:
-        print(
-            f"[tray] open log failed: {e}"
-        )
+        print(f"[tray] open log failed: {e}")
 
 
 def copy_last_to_clipboard(icon_, item):
@@ -534,12 +546,9 @@ def copy_last_to_clipboard(icon_, item):
 
     try:
         import pyperclip
-
         pyperclip.copy(last)
 
-        print(
-            f"[tray] copied last to clipboard: {last!r}"
-        )
+        print(f"[tray] copied last to clipboard: {last!r}")
 
         if icon_:
             icon_.notify(
@@ -548,9 +557,7 @@ def copy_last_to_clipboard(icon_, item):
             )
 
     except Exception as e:
-        print(
-            f"[tray] copy failed: {e}"
-        )
+        print(f"[tray] copy failed: {e}")
 
 
 # ---------- UI окно истории ----------
@@ -568,142 +575,82 @@ def open_history_window(icon_, item):
             _history_window.lift()
             _history_window.focus_force()
             return
-
         except Exception:
             _history_window = None
 
     root = tk.Tk()
-
     _history_window = root
 
-    root.title(
-        "Whisper PTT — история расшифровок"
-    )
-
+    root.title("Whisper PTT — история расшифровок")
     root.geometry("700x450")
 
     top = tk.Frame(root)
-    top.pack(
-        fill="x",
-        padx=8,
-        pady=6
-    )
+    top.pack(fill="x", padx=8, pady=6)
 
     text_widget = None
 
     def copy_selected():
         try:
-            sel = text_widget.get(
-                "sel.first",
-                "sel.last"
-            )
-
+            sel = text_widget.get("sel.first", "sel.last")
         except tk.TclError:
             sel = ""
 
         if sel:
             root.clipboard_clear()
             root.clipboard_append(sel)
-
-            print(
-                f"[ui] copied selection: {sel[:60]!r}"
-            )
+            print(f"[ui] copied selection: {sel[:60]!r}")
 
     def copy_all():
-        all_text = text_widget.get(
-            "1.0",
-            "end"
-        ).strip()
+        all_text = text_widget.get("1.0", "end").strip()
 
         root.clipboard_clear()
         root.clipboard_append(all_text)
 
-        print(
-            f"[ui] copied all ({len(all_text)} chars)"
-        )
+        print(f"[ui] copied all ({len(all_text)} chars)")
 
     def clear_view():
-        text_widget.delete(
-            "1.0",
-            "end"
-        )
+        text_widget.delete("1.0", "end")
 
     def refresh_view():
-        text_widget.delete(
-            "1.0",
-            "end"
-        )
+        text_widget.delete("1.0", "end")
 
-        for i, t in enumerate(
-            _internal_buffer,
-            1
-        ):
-            text_widget.insert(
-                "end",
-                f"{i:>3}. {t}\n"
-            )
+        for i, t in enumerate(_internal_buffer, 1):
+            text_widget.insert("end", f"{i:>3}. {t}\n")
 
     tk.Button(
         top,
         text="Копировать выделенное",
         command=copy_selected
-    ).pack(
-        side="left",
-        padx=2
-    )
+    ).pack(side="left", padx=2)
 
     tk.Button(
         top,
         text="Копировать всё",
         command=copy_all
-    ).pack(
-        side="left",
-        padx=2
-    )
+    ).pack(side="left", padx=2)
 
     tk.Button(
         top,
         text="Очистить вид",
         command=clear_view
-    ).pack(
-        side="left",
-        padx=2
-    )
+    ).pack(side="left", padx=2)
 
     tk.Button(
         top,
         text="Обновить",
         command=refresh_view
-    ).pack(
-        side="left",
-        padx=2
-    )
+    ).pack(side="left", padx=2)
 
     tk.Label(
         top,
-        text=(
-            f"(буфер: до {_internal_buffer.maxlen} шт., "
-            f"в файле: {LOG_FILE.name})"
-        )
-    ).pack(
-        side="right"
-    )
+        text=f"(буфер: до {_internal_buffer.maxlen} шт., в файле: {LOG_FILE.name})"
+    ).pack(side="right")
 
     frame = tk.Frame(root)
-
-    frame.pack(
-        fill="both",
-        expand=True,
-        padx=8,
-        pady=6
-    )
+    frame.pack(fill="both", expand=True, padx=8, pady=6)
 
     scrollbar = tk.Scrollbar(frame)
-
-    scrollbar.pack(
-        side="right",
-        fill="y"
-    )
+    scrollbar.pack(side="right", fill="y")
 
     text_widget = tk.Text(
         frame,
@@ -711,33 +658,19 @@ def open_history_window(icon_, item):
         yscrollcommand=scrollbar.set,
         font=("Consolas", 11)
     )
+    text_widget.pack(side="left", fill="both", expand=True)
 
-    text_widget.pack(
-        side="left",
-        fill="both",
-        expand=True
-    )
-
-    scrollbar.config(
-        command=text_widget.yview
-    )
+    scrollbar.config(command=text_widget.yview)
 
     refresh_view()
-
     text_widget.see("end")
 
     def on_close():
         global _history_window
-
         _history_window = None
-
         root.destroy()
 
-    root.protocol(
-        "WM_DELETE_WINDOW",
-        on_close
-    )
-
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 
@@ -759,6 +692,8 @@ _audio_queue = queue.Queue()
 
 icon = None
 
+# Anti-spam: игнорируем авто-повтор клавиши при удержании
+_hotkey_held = False
 
 COLOR_IDLE = (60, 170, 90)
 COLOR_REC  = (220, 60, 60)
@@ -767,18 +702,10 @@ COLOR_ERR  = (120, 120, 120)
 
 
 def make_image(color):
-    img = Image.new(
-        "RGBA",
-        (64, 64),
-        (0, 0, 0, 0)
-    )
-
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    d.ellipse(
-        (4, 4, 60, 60),
-        fill=color
-    )
+    d.ellipse((4, 4, 60, 60), fill=color)
 
     d.rounded_rectangle(
         (26, 14, 38, 40),
@@ -824,238 +751,83 @@ def set_tray_status(status_text=None):
                     f"Whisper PTT — ready "
                     f"({HOTKEY_STR}, {HOTKEY_MODE})"
                 )
-
         except Exception:
             pass
 
 
 # ---------- Model ----------
+def _find_local_model():
+    """Ищет локальную модель. Интернет здесь не используется."""
+    for cand in [
+        Path(MODEL_NAME),
+        APP_DIR / MODEL_NAME,
+        APP_DIR / "models" / MODEL_NAME,
+        APP_DIR / "models",
+        Path("C:/models") / MODEL_NAME,
+    ]:
+        if cand.is_dir() and (cand / "model.bin").exists():
+            return cand.resolve()
+
+    return None
+
+
 def load_model():
     global model
 
     try:
-        set_tray_status("загрузка 0%")
+        set_tray_status("загрузка модели…")
+        set_color(COLOR_LOAD)
 
-        # Перехват прогресса скачивания весов
-        try:
-            from tqdm.auto import tqdm
+        local_dir = _find_local_model()
 
-            class _TrayDownloadProgress(tqdm):
-                _last_pct = -1
-                _last_t = 0.0
+        if local_dir is None:
+            msg = (
+                f"Локальная модель '{MODEL_NAME}' не найдена. "
+                f"Положите модель в папку models/ рядом со скриптом. "
+                f"Скачивание из интернета отключено."
+            )
+            print(f"[whisper] {msg}")
+            set_color(COLOR_ERR)
+            set_tray_status("ошибка: модель не найдена")
+            if icon:
+                try:
+                    icon.notify(msg, "Whisper PTT")
+                except Exception:
+                    pass
+            return
 
-                def __init__(
-                    self,
-                    *args,
-                    **kwargs
-                ):
-                    kwargs["disable"] = False
+        print(f"[whisper] loading local model: {local_dir}")
+        print("[whisper] no internet download required")
 
-                    super().__init__(
-                        *args,
-                        **kwargs
-                    )
+        if BACKEND == "faster":
+            from faster_whisper import WhisperModel
 
-                    self._report()
-
-                def update(self, n=1):
-                    super().update(n)
-                    self._report()
-
-                def _report(self):
-                    if self.total and self.total > 0:
-                        pct = max(
-                            0,
-                            min(
-                                100,
-                                int(
-                                    (self.n / self.total)
-                                    * 100
-                                )
-                            )
-                        )
-
-                        now = _time.time()
-
-                        if (
-                            pct != _TrayDownloadProgress._last_pct
-                            and (
-                                now
-                                - _TrayDownloadProgress._last_t
-                                >= 0.15
-                                or pct in (0, 100)
-                            )
-                        ):
-                            _TrayDownloadProgress._last_pct = pct
-                            _TrayDownloadProgress._last_t = now
-
-                            set_tray_status(
-                                f"скачивание {pct}%"
-                            )
-
-            import faster_whisper.utils
-
-            faster_whisper.utils.disabled_tqdm = (
-                _TrayDownloadProgress
+            model = WhisperModel(
+                str(local_dir),
+                device=DEVICE,
+                compute_type=COMPUTE_TYPE
             )
 
-        except Exception as e:
-            print(
-                f"[whisper] tqdm patch error: {e}"
+        elif BACKEND == "openai":
+            raise ValueError(
+                "backend=openai отключён в offline-режиме "
+                "(может скачивать модель из интернета). "
+                "Используйте backend=faster с локальной CTranslate2-моделью."
             )
 
-        # Монитор чтения весов
-        stop_monitor = threading.Event()
-
-        def _monitor_loading():
-            try:
-                import psutil
-
-                proc = psutil.Process()
-
-                b_start = proc.io_counters().read_bytes
-
-                size_map = {
-                    "tiny": 75 * 1024 * 1024,
-                    "base": 145 * 1024 * 1024,
-                    "small": 485 * 1024 * 1024,
-                    "medium": 1500 * 1024 * 1024,
-                    "large-v3-turbo": 1600 * 1024 * 1024,
-                    "turbo": 1600 * 1024 * 1024,
-                    "large-v3": 3100 * 1024 * 1024,
-                    "large": 3100 * 1024 * 1024,
-                }
-
-                expected = size_map.get(
-                    MODEL_NAME.lower(),
-                    1600 * 1024 * 1024
-                )
-
-                last_pct = 0
-                t0 = _time.time()
-
-                while not stop_monitor.wait(0.2):
-                    read_b = (
-                        proc.io_counters().read_bytes
-                        - b_start
-                    )
-
-                    if read_b > 0:
-                        pct = min(
-                            98,
-                            int(
-                                (read_b / expected)
-                                * 100
-                            )
-                        )
-                    else:
-                        pct = min(
-                            90,
-                            int(
-                                (_time.time() - t0)
-                                * 8
-                            )
-                        )
-
-                    if pct > last_pct:
-                        last_pct = pct
-
-                        set_tray_status(
-                            f"загрузка {pct}%"
-                        )
-
-            except Exception:
-                pass
-
-        monitor_th = threading.Thread(
-            target=_monitor_loading,
-            daemon=True
-        )
-
-        monitor_th.start()
-
-        # Автопоиск локальной папки с моделью
-        local_dir = None
-
-        for cand in [
-            Path(MODEL_NAME),
-            APP_DIR / MODEL_NAME,
-            APP_DIR / "models" / MODEL_NAME,
-            Path("C:/models") / MODEL_NAME,
-        ]:
-            if (
-                cand.is_dir()
-                and (cand / "model.bin").exists()
-            ):
-                local_dir = str(
-                    cand.resolve()
-                )
-                break
-
-        target_model = (
-            local_dir
-            if local_dir
-            else MODEL_NAME
-        )
-
-        try:
-            if BACKEND == "faster":
-                from faster_whisper import WhisperModel
-
-                if local_dir:
-                    print(
-                        f"[whisper] offline load from: "
-                        f"{local_dir}"
-                    )
-                else:
-                    print(
-                        f"[whisper] loading "
-                        f"{MODEL_NAME} on "
-                        f"{DEVICE} "
-                        f"({COMPUTE_TYPE})…"
-                    )
-
-                model = WhisperModel(
-                    target_model,
-                    device=DEVICE,
-                    compute_type=COMPUTE_TYPE
-                )
-
-            elif BACKEND == "openai":
-                import whisper
-
-                model = whisper.load_model(
-                    MODEL_NAME,
-                    device=DEVICE
-                )
-
-            else:
-                raise ValueError(
-                    f"Unknown backend: {BACKEND}"
-                )
-
-        finally:
-            stop_monitor.set()
-            monitor_th.join(
-                timeout=1.0
-            )
+        else:
+            raise ValueError(f"Unknown backend: {BACKEND}")
 
         model_ready.set()
-
         set_color(COLOR_IDLE)
         set_tray_status(None)
 
-        print(
-            f"[whisper] READY "
-            f"({BACKEND}, "
-            f"{DEVICE}, "
-            f"{COMPUTE_TYPE})"
-        )
+        print(f"[whisper] READY ({BACKEND}, {DEVICE}, {COMPUTE_TYPE})")
+
+        play_ready_sound()
 
     except Exception as e:
-        print(
-            f"[whisper] FAILED: {e}"
-        )
+        print(f"[whisper] FAILED: {e}")
 
         set_color(COLOR_ERR)
 
@@ -1070,20 +842,11 @@ def load_model():
 
 
 # ---------- Persistent Audio Stream ----------
-def _audio_cb(
-    indata,
-    frames,
-    time_info,
-    status
-):
+def _audio_cb(indata, frames, time_info, status):
     if recording:
-        audio_chunks.append(
-            indata.copy()
-        )
+        audio_chunks.append(indata.copy())
     else:
-        _preroll_buffer.append(
-            indata.copy()
-        )
+        _preroll_buffer.append(indata.copy())
 
 
 def init_audio_stream():
@@ -1107,30 +870,23 @@ def init_audio_stream():
 
     except Exception as e:
         print(
-            f"[audio] failed to start "
-            f"audio stream: {e}"
+            f"[audio] failed to start audio stream: {e}"
         )
 
 
 def start_recording():
-    global recording
-    global audio_chunks
+    global recording, audio_chunks
 
     if not model_ready.is_set():
-        print(
-            "[rec] model not ready"
-        )
+        print("[rec] model not ready")
         return
 
     with stream_lock:
         if recording:
             return
 
-        # Захватываем pre-roll буфер
-        audio_chunks = list(
-            _preroll_buffer
-        )
-
+        # Захватываем pre-roll буфер, чтобы не потерять начало фразы.
+        audio_chunks = list(_preroll_buffer)
         _preroll_buffer.clear()
 
         recording = True
@@ -1143,9 +899,8 @@ def start_recording():
             f"({HOTKEY_STR}, {HOTKEY_MODE})"
         )
 
-    print(
-        "[rec] started"
-    )
+    print("[rec] started")
+    play_start_sound()
 
 
 def stop_recording():
@@ -1156,10 +911,7 @@ def stop_recording():
             return
 
         recording = False
-
-        chunks = list(
-            audio_chunks
-        )
+        chunks = list(audio_chunks)
 
     set_color(COLOR_IDLE)
 
@@ -1173,6 +925,8 @@ def stop_recording():
         "[rec] stopped, queued for transcription"
     )
 
+    play_end_sound()
+
     _audio_queue.put(chunks)
 
 
@@ -1183,12 +937,10 @@ def _worker_loop():
 
         try:
             process_audio(chunks)
-
         except Exception as e:
             print(
                 f"[worker] process error: {e}"
             )
-
         finally:
             _audio_queue.task_done()
 
@@ -1213,7 +965,7 @@ def process_audio(chunks):
         )
         return
 
-    # Отсекаем слишком короткие клики
+    # Отсекаем слишком короткие клики (< 0.35 сек).
     if len(audio) < SAMPLE_RATE * 0.35:
         print(
             "[rec] too short, skip"
@@ -1231,7 +983,6 @@ def process_audio(chunks):
 
     try:
         with model_lock:
-
             if BACKEND == "faster":
                 segments, _ = model.transcribe(
                     audio,
@@ -1281,7 +1032,6 @@ def process_audio(chunks):
     text = text.strip()
 
     dur = len(audio) / SAMPLE_RATE
-
     dt = _time.time() - t0
 
     print(
@@ -1308,9 +1058,7 @@ def process_audio(chunks):
         play_ready_sound()
 
     else:
-        print(
-            "[rec] empty result"
-        )
+        print("[rec] empty result")
 
     if icon:
         icon.title = (
@@ -1321,7 +1069,6 @@ def process_audio(chunks):
 
 def type_text_to_active_window(text):
     _release_all_modifiers()
-
     _time.sleep(0.01)
 
     t0 = _time.time()
@@ -1352,7 +1099,6 @@ def type_text_to_active_window(text):
 def paste_via_clipboard(text):
     try:
         import pyperclip
-
         pyperclip.copy(text)
 
     except Exception as e:
@@ -1362,30 +1108,15 @@ def paste_via_clipboard(text):
         return
 
     _release_all_modifiers()
-
     _time.sleep(0.02)
 
-    _send_key(
-        VK_LCONTROL,
-        up=False
-    )
-
-    _send_key(
-        VK_V,
-        up=False
-    )
+    _send_key(VK_LCONTROL, up=False)
+    _send_key(VK_V, up=False)
 
     _time.sleep(0.01)
 
-    _send_key(
-        VK_V,
-        up=True
-    )
-
-    _send_key(
-        VK_LCONTROL,
-        up=True
-    )
+    _send_key(VK_V, up=True)
+    _send_key(VK_LCONTROL, up=True)
 
     print(
         f"[paste] pasted "
@@ -1411,17 +1142,21 @@ def _is_hotkey(key):
 
 
 def on_press(key):
+    global _hotkey_held
+
     if not _is_hotkey(key):
         return
 
-    # =========================================================
-    # TOGGLE MODE
-    # Нажал F9 один раз  -> начать запись
-    # Нажал F9 второй раз -> остановить запись
-    # Отпускание F9 игнорируется
-    # =========================================================
-    if HOTKEY_MODE == "toggle":
+    # Игнорируем авто-повтор при удержании клавиши
+    if _hotkey_held:
+        return
 
+    _hotkey_held = True
+
+    if HOTKEY_MODE == "toggle":
+        # Нажал F9:
+        #   не записываем -> начинаем
+        #   записываем -> останавливаем
         if recording:
             stop_recording()
         else:
@@ -1429,30 +1164,26 @@ def on_press(key):
 
         return
 
-    # =========================================================
-    # HOLD MODE
-    # Старое поведение:
-    # зажал F9 -> запись
-    # отпустил F9 -> остановка
-    # =========================================================
-
+    # HOLD
     if recording:
-        return  # автоповтор F9 — игнор
+        return
 
     start_recording()
 
 
 def on_release(key):
+    global _hotkey_held
+
     if not _is_hotkey(key):
         return
 
-    # В toggle-режиме отпускание F9
-    # вообще ничего не делает.
+    _hotkey_held = False
+
+    # В toggle отпускание кнопки ничего не делает.
     if HOTKEY_MODE == "toggle":
         return
 
-    # В hold-режиме отпускание F9
-    # останавливает запись.
+    # HOLD
     if not recording:
         return
 
@@ -1470,6 +1201,12 @@ def run_listener():
 # ---------- Tray ----------
 def on_quit(icon_, item):
     global stream
+
+    # Закрываем все MCI устройства
+    try:
+        _winmm.mciSendStringW("close all", None, 0, None)
+    except Exception:
+        pass
 
     if stream is not None:
         try:
@@ -1493,12 +1230,11 @@ def main():
         make_image(COLOR_LOAD),
 
         title=(
-            f"Whisper PTT — загрузка 0% "
+            f"Whisper PTT — загрузка модели… "
             f"({HOTKEY_STR}, {HOTKEY_MODE})"
         ),
 
         menu=Menu(
-
             MenuItem(
                 f"Хоткей: {HOTKEY_STR}",
                 None,
@@ -1518,15 +1254,13 @@ def main():
             ),
 
             MenuItem(
-                f"Устройство: "
-                f"{DEVICE} / {COMPUTE_TYPE}",
+                f"Устройство: {DEVICE} / {COMPUTE_TYPE}",
                 None,
                 enabled=False
             ),
 
             MenuItem(
-                f"Метод вставки: "
-                f"{PASTE_METHOD}",
+                f"Метод вставки: {PASTE_METHOD}",
                 None,
                 enabled=False
             ),
@@ -1565,10 +1299,9 @@ def main():
         daemon=True
     ).start()
 
-    threading.Thread(
-        target=load_sound,
-        daemon=True
-    ).start()
+    # Загружаем звуки ДО модели, чтобы сигнал готовности
+    # гарантированно проигрался.
+    load_sound()
 
     threading.Thread(
         target=load_model,
