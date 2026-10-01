@@ -5,12 +5,7 @@
         "**/.hg": true,
         "**/.jj": true,
         "**/.DS_Store": true,
-        "**/Thumbs.db": true,
-        ".vscode": true,
-        "__pycache__": true
+        "**/Thumbs.db": true
     },
-    "hide-files.files": [
-        ".vscode",
-        "__pycache__"
-    ]
+    "hide-files.files": []
 }
