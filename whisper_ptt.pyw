@@ -645,6 +645,7 @@ def process_audio(chunks):
         "вы можете помочь развитию канала",
         "я в вк",
         "музыка",
+        "продолжение следует",
     ]
     _text_lower = text.lower()
     for _hall in _HALLUCINATIONS:
