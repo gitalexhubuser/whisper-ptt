@@ -16,3 +16,15 @@ nvidia-cuda-runtime-cu12
 nvidia-cuda-nvrtc-cu12
 
 ## pip install -r requirements.txt
+
+
+----------
+
+бля забагалось
+(через впн ставил)
+
+В той же консоли выполните удаление конфликтующих библиотек:
+pip uninstall nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 -y
+
+Обновите основной движок распознавания, чтобы он подтянул совместимые компоненты:
+pip install faster-whisper ctranslate2 --upgrade
